@@ -572,13 +572,6 @@ static void i3c_hub_agent_ibi(struct i3c_hub_smbus_agent *agent)
 		agent->tx_res = stat;
 		complete(&agent->completion);
 		spin_unlock_irqrestore(&agent->lock, flags);
-
-		ret = regmap_write(hub->regmap,
-				   HUB_REG_TP_SMBUS_AGNT_STS(agent->port_nr),
-				   HUB_REG_AGENT_CNTRL_STATUS_FINISH);
-		if (ret)
-			dev_warn(&hub->i3cdev->dev,
-				 "TP[%d] - failed to clear finish status\n", agent->port_nr);
 	}
 
 #if IS_ENABLED(CONFIG_I2C_SLAVE)
@@ -738,14 +731,30 @@ static int i3c_hub_agent_i2c_xfer_one(struct i3c_hub_smbus_agent *agent,
 	wait_time = wait_for_completion_timeout(&agent->completion,
 						agent->i2c.timeout);
 	if (!wait_time) {
-		i3c_hub_reset_smbus_agent(agent);
-		dev_err(&hub->i3cdev->dev, "tx timeout!\n");
-		ret = -ETIMEDOUT;
-		return ret;
+		/* Re-check status in case IBI has error */
+		ret = regmap_read(hub->regmap, HUB_REG_TP_SMBUS_AGNT_STS(agent->port_nr),
+				  &port_stat);
+		if (!ret && (port_stat & HUB_REG_AGENT_CNTRL_STATUS_FINISH)) {
+			dev_warn(&hub->i3cdev->dev,
+				 "port[%d]: finish status set but no completion! (%d, %02X)\n",
+				 port, ret, port_stat);
+		} else {
+			dev_err(&hub->i3cdev->dev, "port[%d]: tx timeout!\n", port);
+			i3c_hub_reset_smbus_agent(agent);
+			ret = -ETIMEDOUT;
+			return ret;
+		}
+	} else {
+		spin_lock_irqsave(&agent->lock, flags);
+		port_stat = agent->tx_res;
+		spin_unlock_irqrestore(&agent->lock, flags);
 	}
-	spin_lock_irqsave(&agent->lock, flags);
-	port_stat = agent->tx_res;
-	spin_unlock_irqrestore(&agent->lock, flags);
+	/* clear finish status */
+	ret = regmap_write(hub->regmap,
+			   HUB_REG_TP_SMBUS_AGNT_STS(agent->port_nr),
+			   HUB_REG_AGENT_CNTRL_STATUS_FINISH);
+	if (ret)
+		dev_warn(dev, "TP[%d] - failed to clear finish status\n", agent->port_nr);
 
 	txn_stat = port_stat >> HUB_REG_AGENT_CNTRL_STATUS_TXN_SHIFT;
 	switch (txn_stat) {
