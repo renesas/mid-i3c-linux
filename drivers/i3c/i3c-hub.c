@@ -369,6 +369,8 @@ struct i3c_hub {
 
 	/* protects page access */
 	struct mutex lock;
+	/* Sequential execution of IBI handler*/
+	struct mutex ibi_lock;
 
 	struct delayed_work delayed_work;
 
@@ -2217,6 +2219,8 @@ static void i3c_hub_ibi(struct i3c_device *i3c,
 	const struct i3c_hub_ibi_payload *p = NULL;
 	unsigned int i, dev_stat, target_stat;
 
+	mutex_lock(&hub->ibi_lock);
+
 	if (payload->len == sizeof(*p))
 		p = payload->data;
 
@@ -2232,7 +2236,7 @@ static void i3c_hub_ibi(struct i3c_device *i3c,
 
 		ret = regmap_bulk_read(hub->regmap, HUB_REG_DEV_AND_PORT_IBI_STS, tmp, 2);
 		if (ret)
-			return;
+			goto exit;
 
 		dev_stat = tmp[0];
 		target_stat = tmp[1];
@@ -2263,6 +2267,8 @@ static void i3c_hub_ibi(struct i3c_device *i3c,
 			i3c_hub_agent_ibi(port->agent);
 		}
 	}
+exit:
+	mutex_unlock(&hub->ibi_lock);
 }
 
 static const struct i3c_ibi_setup i3c_hub_ibi_setup = {
@@ -2340,6 +2346,7 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 	hub->regmap = regmap;
 
 	mutex_init(&hub->lock);
+	mutex_init(&hub->ibi_lock);
 
 	/* Disable all slave ports */
 	i3c_hub_unprotect_register(hub);
