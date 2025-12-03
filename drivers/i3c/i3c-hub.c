@@ -393,14 +393,23 @@ static inline int i3c_hub_port_disable(struct i3c_hub *hub, unsigned int port_nr
 	return regmap_clear_bits(hub->regmap, HUB_REG_TP_ENABLE, 1u << port_nr);
 }
 
-static inline int i3c_hub_unprotect_register(struct i3c_hub *hub)
+static int i3c_hub_unprotect_register(struct i3c_hub *hub, u8 *orig_code)
 {
+	int ret;
+	unsigned int val;
+
+	if (orig_code) {
+		ret = regmap_read(hub->regmap, HUB_REG_PROTECTION, &val);
+		if (ret)
+			return ret;
+		*orig_code = (u8)val;
+	}
 	return regmap_write(hub->regmap, HUB_REG_PROTECTION, REGISTERS_UNLOCK_CODE);
 }
 
-static inline int i3c_hub_protect_register(struct i3c_hub *hub)
+static int i3c_hub_protect_register(struct i3c_hub *hub, u8 code)
 {
-	return regmap_write(hub->regmap, HUB_REG_PROTECTION, REGISTERS_LOCK_CODE);
+	return regmap_write(hub->regmap, HUB_REG_PROTECTION, code);
 }
 
 static int i3c_hub_write_paged(struct i3c_hub *hub, unsigned int page,
@@ -467,6 +476,9 @@ struct i3c_hub_smbus_agent {
 	/* protects tx_res */
 	spinlock_t lock;
 	u8 tx_res;
+
+	/* Agent error*/
+	u32 error;
 
 	struct completion completion;
 };
@@ -614,28 +626,121 @@ static void i3c_hub_agent_ibi(struct i3c_hub_smbus_agent *agent)
 #endif
 }
 
-static int i3c_hub_reset_smbus_agent(struct i3c_hub_smbus_agent *agent)
+static int i3c_hub_get_target_bus_stat(struct i3c_hub *hub, int port_nr, u8 *scl_stat, u8 *sda_stat)
+{
+	u8 buf[2];
+	int ret;
+
+	ret = regmap_bulk_read(hub->regmap, HUB_REG_TP_SCL_IN_LEVEL_STS, buf, 2);
+	if (ret)
+		return ret;
+
+	*scl_stat = buf[0] >> port_nr & 0x1;
+	*sda_stat = buf[1] >> port_nr & 0x1;
+
+	return 0;
+}
+
+static int i3c_hub_reset_smbus_agent(struct i3c_hub_smbus_agent *agent, int level)
 {
 	struct i3c_hub *hub = agent->hub;
 	int ret;
-	unsigned int val;
+	struct i3c_hub_agent_tx_hdr hdr = { 0 };
+	int i;
+	u8 scl_stat, sda_stat;
+	u8 code;
 
-	i3c_hub_unprotect_register(hub);
+	ret = i3c_hub_unprotect_register(hub, &code);
+	if (ret)
+		return ret;
 
-	ret = regmap_read(hub->regmap, HUB_REG_TP_SMBUS_AGNT_EN, &val);
+	ret = regmap_clear_bits(hub->regmap, HUB_REG_TP_IBI_CONF, agent->port_mask);
 	if (ret)
-		goto err_exit;
-	ret = regmap_write(hub->regmap, HUB_REG_TP_SMBUS_AGNT_EN, val & ~agent->port_mask);
-	if (ret)
-		goto err_exit;
-	ret = regmap_write(hub->regmap, HUB_REG_TP_SMBUS_AGNT_EN, val);
-	if (ret)
-		goto err_exit;
+		goto reset_exit;
 
-err_exit:
+	ret = regmap_clear_bits(hub->regmap, HUB_REG_TP_SMBUS_AGNT_EN, agent->port_mask);
+	if (ret)
+		goto reset_exit;
+
+	ret = regmap_set_bits(hub->regmap, HUB_REG_TP_SMBUS_AGNT_EN, agent->port_mask);
+	if (ret)
+		goto reset_exit;
+
+	ret = regmap_test_bits(hub->regmap, HUB_REG_TP_SMBUS_AGNT_TRANS_START, agent->port_mask);
+	if (ret) {
+		dev_warn(&hub->i3cdev->dev, "TP[%d]: SMbus Agent reset(0) failed (%d)\n",
+			 agent->port_nr, ret);
+		ret = -EBUSY;
+		goto reset_exit;
+	}
+
+	if (level == 0) {
+		dev_info(&hub->i3cdev->dev,
+			 "TP[%d] Reset Level 0 done\n",
+			 agent->port_nr);
+		ret = 0;
+		goto reset_exit;
+	}
+
+	ret = i3c_hub_get_target_bus_stat(hub, agent->port_nr, &scl_stat, &sda_stat);
+	if (ret)
+		return ret;
+	if (scl_stat == 0 || sda_stat == 0) {
+		dev_warn(&hub->i3cdev->dev,
+			 "TP[%d], SMBus Agent reset(1) aborted: bus busy: SCL=%d, SDA=%d\n",
+			 agent->port_nr, scl_stat, sda_stat);
+		return -EBUSY;
+	}
+
+	ret = regmap_write(hub->regmap,
+			   HUB_REG_TP_SMBUS_AGNT_STS(agent->port_nr),
+			   HUB_REG_AGENT_CNTRL_STATUS_FINISH);
+	if (ret)
+		goto reset_exit;
+
+	hdr.addr_rnw = 0;
+	hdr.type = 0x40;
+	hdr.wr_len = 36;
+	hdr.rd_len = 0;
+	ret = i3c_hub_write_paged(hub, HUB_PAGE_AGENT_TX(agent->port_nr), 0,
+				  &hdr, sizeof(hdr));
+	if (ret)
+		goto reset_exit;
+
+	ret = regmap_write(hub->regmap, HUB_REG_TP_SMBUS_AGNT_TRANS_START, agent->port_mask);
+	if (ret)
+		goto reset_exit;
+
+	msleep(36);
+
+	for (i = 0; i < 100; i++) {
+		ret = regmap_test_bits(hub->regmap, HUB_REG_TP_SMBUS_AGNT_STS(agent->port_nr),
+				       0x01);
+		if (ret)
+			break;
+	}
+
+	if (ret == 1) {
+		dev_info(&hub->i3cdev->dev, "TP[%d] SMBus Agent reset(1) completed:(%d)\n",
+			 agent->port_nr, i);
+		ret = 0;
+	} else {
+		dev_warn(&hub->i3cdev->dev, "TP[%d] SMBus Agent reset(1) failed (%d, %d)\n",
+			 agent->port_nr, ret, i);
+		ret = 0;
+	}
+
+reset_exit:
 	if (ret)
 		dev_err(&hub->i3cdev->dev, "Failed to reset smbus agent:%d\n", ret);
-	i3c_hub_protect_register(hub);
+
+	ret = regmap_write(hub->regmap,
+			   HUB_REG_TP_SMBUS_AGNT_STS(agent->port_nr),
+			   HUB_REG_AGENT_CNTRL_STATUS_FINISH);
+	ret = regmap_set_bits(hub->regmap, HUB_REG_TP_IBI_CONF, agent->port_mask);
+
+	i3c_hub_protect_register(hub, code);
+
 	return ret;
 }
 
@@ -677,10 +782,18 @@ static int i3c_hub_agent_i2c_xfer_one(struct i3c_hub_smbus_agent *agent,
 	unsigned char rx_buf[I3C_HUB_CONTROLLER_BUFFER_SIZE] = { 0 };
 	int ret;
 
+	if (agent->error) {
+		dev_info(&hub->i3cdev->dev, "previous error detected, resetting agent on port %d\n",
+			 port);
+		i3c_hub_reset_smbus_agent(agent, 1);
+		agent->error = 0;
+	}
+
 	if (rd_msg && (rd_msg->flags & I2C_M_RECV_LEN))
 		rd_msg->len = I2C_SMBUS_BLOCK_MAX + rd_msg->len;
 
 	hdr.type |= tx_clk_to_type(agent->clk_freq);
+	hdr.type |= 0x1 << 3;
 	if (wr_msg && rd_msg) {
 		if (wr_msg->addr != rd_msg->addr) {
 			dev_err(&hub->i3cdev->dev, "different addr in i2c wr and rd msgs\n");
@@ -742,7 +855,8 @@ static int i3c_hub_agent_i2c_xfer_one(struct i3c_hub_smbus_agent *agent,
 				 port, ret, port_stat);
 		} else {
 			dev_err(&hub->i3cdev->dev, "port[%d]: tx timeout!\n", port);
-			i3c_hub_reset_smbus_agent(agent);
+			i3c_hub_reset_smbus_agent(agent, 0);
+			agent->error = 1;
 			ret = -ETIMEDOUT;
 			return ret;
 		}
@@ -1886,7 +2000,7 @@ static int i3c_hub_read_identify_tp(struct i3c_hub *hub)
 
 	dev_info(&hub->i3cdev->dev, "Use TP[%d] for identification\n", tp_nr);
 
-	ret = i3c_hub_unprotect_register(hub);
+	ret = i3c_hub_unprotect_register(hub, NULL);
 	if (ret)
 		goto out;
 
@@ -1932,7 +2046,7 @@ recover:
 
 out:
 	i3c_hub_port_disable(hub, tp_nr);
-	i3c_hub_protect_register(hub);
+	i3c_hub_protect_register(hub, REGISTERS_LOCK_CODE);
 
 	if (tp_id < 0)
 		dev_warn(&hub->i3cdev->dev, "tp_id read failed.\n");
@@ -2298,7 +2412,7 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 
 	mutex_lock(&hub_lock);
 
-	i3c_hub_unprotect_register(hub);
+	i3c_hub_unprotect_register(hub, NULL);
 
 	for (i = 0; i < hub->devinfo->n_ports; ++i) {
 		dev_info(dev, "Init target port[%d] ...\n", i);
@@ -2316,7 +2430,7 @@ static void i3c_hub_delayed_work(struct work_struct *work)
 		}
 	}
 
-	i3c_hub_protect_register(hub);
+	i3c_hub_protect_register(hub, REGISTERS_LOCK_CODE);
 
 	i3c_hub_target_port_debugfs_init(hub);
 
@@ -2349,11 +2463,10 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 	mutex_init(&hub->ibi_lock);
 
 	/* Disable all slave ports */
-	i3c_hub_unprotect_register(hub);
+	i3c_hub_unprotect_register(hub, NULL);
 	ret = regmap_write(hub->regmap, HUB_REG_TP_ENABLE, 0x00);
 	if (ret)
 		return ret;
-	i3c_hub_protect_register(hub);
 
 	hub->driving_master = i3c_dev_get_master(i3cdev->desc);
 
@@ -2364,8 +2477,6 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 	if (!hub->of_node)
 		dev_info(dev, "No DT entry - running with hardware defaults.\n");
 
-	i3c_hub_unprotect_register(hub);
-
 	ret = i3c_hub_hw_init(hub);
 	if (ret) {
 		dev_err(dev, "device init failed\n");
@@ -2374,7 +2485,7 @@ static int i3c_hub_probe(struct i3c_device *i3cdev)
 
 	i3c_hub_populate_target_ports(hub);
 
-	i3c_hub_protect_register(hub);
+	i3c_hub_protect_register(hub, REGISTERS_LOCK_CODE);
 
 #ifndef CONFIG_I3C_HUB_POLLING_MODE
 	ret = i3c_device_request_ibi(hub->i3cdev, &i3c_hub_ibi_setup);
