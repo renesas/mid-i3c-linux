@@ -2244,6 +2244,7 @@ static int i3c_hub_hw_init(struct i3c_hub *hub)
 static int i3c_hub_port_init(struct i3c_hub *hub, u32 port_nr)
 {
 	struct i3c_hub_target_port *port;
+	unsigned int val;
 	int ret;
 
 	if (port_nr >= I3C_HUB_TP_MAX_COUNT)
@@ -2268,12 +2269,36 @@ static int i3c_hub_port_init(struct i3c_hub *hub, u32 port_nr)
 			return ret;
 	}
 
+	/* Check target port VIO Power Good */
+	ret = regmap_read(hub->regmap, HUB_REG_LDO_AND_CPSEL_STS, &val);
+	if (ret)
+		return ret;
+	if (port_nr == 0 || port_nr == 1 || port_nr == 4 || port_nr == 5) {
+		if (!(val & VCCIO0_PWR_GOOD)) {
+			dev_err(&hub->i3cdev->dev, "port[%d], VIOS0 is not good:%02X\n",
+				port_nr, val);
+			return -EIO;
+		}
+	} else {
+		if (!(val & VCCIO1_PWR_GOOD)) {
+			dev_err(&hub->i3cdev->dev, "port[%d], VIOS1 is not good:%02X\n",
+				port_nr, val);
+			return -EIO;
+		}
+	}
+
 	switch (port->mode) {
 	case PORT_MODE_AGENT:
 		ret = i3c_hub_port_init_smbus_agent(hub, port, port_nr);
+		if (ret)
+			dev_warn(&hub->i3cdev->dev, "Failed to init SMBus agent port %d: %d\n",
+				 port_nr, ret);
 		break;
 	case PORT_MODE_I3C:
 		ret = i3c_hub_port_init_i3c_bridge(hub, port, port_nr);
+		if (ret)
+			dev_warn(&hub->i3cdev->dev, "Failed to init I3C bridge port %d: %d\n",
+				 port_nr, ret);
 		if (port->bridge)
 			ret = i3c_hub_bridge_disconnect(port->bridge);
 		break;
