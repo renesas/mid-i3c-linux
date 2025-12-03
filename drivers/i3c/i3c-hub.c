@@ -1031,66 +1031,68 @@ static int smbus_agent_sync_next_buf_idx(struct i3c_hub_smbus_agent *agent, u32 
 	unsigned int stat, rx_done;
 	int ret;
 	int i = 0;
-	unsigned int pullup;
+	u8 scl_stat, sda_stat;
 
-	ret = regmap_read(hub->regmap, HUB_REG_TP_PULLUP_EN, &pullup);
+	*next_buf_idx = 0;
+
+	ret = i3c_hub_get_target_bus_stat(hub, agent->port_nr, &scl_stat, &sda_stat);
 	if (ret)
 		return ret;
 
-	ret = regmap_write(hub->regmap, HUB_REG_TP_PULLUP_EN, pullup | agent->port_mask);
-	if (ret)
-		goto err_recover;
+	if (!scl_stat || !sda_stat) {
+		dev_warn(&hub->i3cdev->dev,
+			 "port[%d] bus not idle (SCL:%d, SDA:%d), skip buffer sync\n",
+			 agent->port_nr, scl_stat, sda_stat);
+		return 0;
+	}
+
+	stat_reg = HUB_REG_TP_SMBUS_AGNT_STS(agent->port_nr);
+	page = HUB_PAGE_AGENT_TX(agent->port_nr);
 
 	ret = regmap_set_bits(hub->regmap, HUB_REG_ONCHIP_TD_AND_SMBUS_AGNT_CONF, 0x1);
 	if (ret)
 		goto err_recover;
 
-	stat_reg = HUB_REG_TP_SMBUS_AGNT_STS(agent->port_nr);
-	page = HUB_PAGE_AGENT_TX(agent->port_nr);
+	hdr.addr_rnw = dev_addr << 1;
+	hdr.type = 0x1 << 3 | 0x1 << 4;
+	ret = i3c_hub_write_paged(hub, page, 0, &hdr, sizeof(hdr));
+	if (ret)
+		goto err_recover;
 
 	ret = regmap_write(hub->regmap, stat_reg, 0x0f);
 	if (ret)
 		goto err_recover;
 
-	hdr.addr_rnw = dev_addr << 1;
-	ret = i3c_hub_write_paged(hub, page, 0, &hdr, sizeof(hdr));
-	if (ret)
-		goto err_recover;
 	ret = regmap_write(hub->regmap, HUB_REG_TP_SMBUS_AGNT_TRANS_START, 0x1 << agent->port_nr);
 	if (ret)
 		goto err_recover;
 
 	rx_done = HUB_REG_AGENT_CNTRL_STATUS_RX_BUF0 | HUB_REG_AGENT_CNTRL_STATUS_RX_BUF1;
+	stat = 0;
+	i = 0;
 	do {
 		ret = regmap_read(hub->regmap, stat_reg, &stat);
-		if (ret)
-			goto err_recover;
-		if (stat & rx_done)
+		if (!ret && (stat & rx_done))
 			break;
-	} while (i++ < 100);
+	} while (++i < 30);
 
-	if (!(stat & rx_done)) {
-		dev_err(&hub->i3cdev->dev, "port[%d] agent loopback unfinished:%02X\n",
-			agent->port_nr, stat);
-		ret = EIO;
-		goto err_recover;
-	}
-	stat = (stat >> 1) & 0xFF;
-	if (stat == 0x01) {
+	if (stat & 0x02) {
 		*next_buf_idx = 1;
-	} else if (stat == 0x02) {
+	} else if (stat & 0x04) {
 		*next_buf_idx = 0;
 	} else {
-		dev_err(&hub->i3cdev->dev, "port[%d] agent loopback error state:%02X\n",
-			agent->port_nr, stat);
-		ret = EIO;
+		dev_warn(&hub->i3cdev->dev, "port[%d] agent loopback error: (%d, %02X)\n",
+			 agent->port_nr, i, stat);
+		*next_buf_idx = 0;
+		agent->error = 1;
+		/* Ignore the sync failure */
+		ret = 0;
 		goto err_recover;
 	}
 
 	ret = 0;
 
 err_recover:
-	regmap_write(hub->regmap, HUB_REG_TP_PULLUP_EN, pullup);
 	regmap_write(hub->regmap, stat_reg, 0x0f);
 	regmap_clear_bits(hub->regmap, HUB_REG_ONCHIP_TD_AND_SMBUS_AGNT_CONF, 0x1);
 	return ret;
@@ -1151,7 +1153,7 @@ static int i3c_hub_port_init_smbus_agent(struct i3c_hub *hub,
 	/* Sync the rx_buf index */
 	ret = smbus_agent_sync_next_buf_idx(agent, &agent->next_buf_idx);
 	if (ret) {
-		dev_err(&hub->i3cdev->dev, "SMBus Agent Rx buf sync failed\n");
+		dev_warn(&hub->i3cdev->dev, "SMBus Agent Rx buf sync failed\n");
 		return ret;
 	}
 
