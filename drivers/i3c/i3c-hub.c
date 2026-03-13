@@ -1998,11 +1998,12 @@ static int i3c_hub_read_identify_tp(struct i3c_hub *hub)
 #ifdef CONFIG_I3C_HUB_TP_IDENDIFY
 	int tp_nr = CONFIG_I3C_HUB_IDENTIFY_TP_NR;
 	unsigned int sscl_input, ssda_input, reg19, pull_ups;
+	u8 reg16;
 	int ret;
 
 	dev_info(&hub->i3cdev->dev, "Use TP[%d] for identification\n", tp_nr);
 
-	ret = i3c_hub_unprotect_register(hub, NULL);
+	ret = i3c_hub_unprotect_register(hub, &reg16);
 	if (ret)
 		goto out;
 
@@ -2048,7 +2049,7 @@ recover:
 
 out:
 	i3c_hub_port_disable(hub, tp_nr);
-	i3c_hub_protect_register(hub, REGISTERS_LOCK_CODE);
+	i3c_hub_protect_register(hub, reg16);
 
 	if (tp_id < 0)
 		dev_warn(&hub->i3cdev->dev, "tp_id read failed.\n");
